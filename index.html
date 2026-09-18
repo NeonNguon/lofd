@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>100 Locations</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    /* ── Layout + light-theme tokens (dark mode redefines the panel ones) ── */
+    :root {
+      /* Title bar + toolbar, measured off the real elements by JS —
+         see syncHeaderHeight(). */
+      --header-h: 94px;
+      --right-col: clamp(380px, 32vw, 640px);
+      /* How the video and text split the right column's height.
+         The picture inside LotteryAll.mp4 is 1620x1080 (3:2) pillarboxed in a
+         1920x1080 frame, so a 3:2 row plus object-fit:cover crops the file's
+         own black bars away and the picture fills the cell exactly - nothing
+         letterboxes, and nothing reframes when you go fullscreen. The -1px/+1px
+         account for the panel's 1px separators. Set this to `1fr 1fr` for a
+         plain half-and-half split, or `3fr 2fr` etc. to size it by hand. */
+      --right-split: calc((var(--right-col) - 1px) * 2 / 3 + 1px) minmax(0, 1fr);
+
+      --panel-border: #ccc;
+      --panel-bg: #fafafa;
+      --panel-heading: #888;
+      --panel-rule: rgba(0, 0, 0, 0.12);
+      --panel-text: #444;
+      --panel-scroll: rgba(0, 0, 0, 0.18);
+      /* Only visible if the file is missing - a dark block, never white. */
+      --video-bg: #111;
+    }
+
+    html, body { height: 100%; }
+    body {
+      background: #fff;
+      overflow: hidden;
+      font-family: 'Courier New', monospace;
+      display: flex; flex-direction: column;
+    }
+    #loading {
+      position: fixed; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      color: #222; font-size: 1.4rem; background: #fff; z-index: 2000;
+    }
+
+    /* ── Title bar ── */
+    #title-bar {
+      flex: 0 0 auto;
+      background: #fff;
+      border-bottom: 1px solid #ccc;
+      padding: 12px 18px;   /* same 18px inset as the toolbar, so the edges line up */
+    }
+    #title-bar h1 {
+      font-size: 16px; font-weight: bold; line-height: 1.3;
+      color: #000;
+    }
+    #title-bar .byline { font-weight: normal; }
+
+    /* ── Top control bar ── */
+    #panel {
+      flex: 0 0 auto;
+      background: rgba(255, 255, 255, 0.88);
+      backdrop-filter: blur(6px);
+      border-bottom: 1px solid #ccc;
+      padding: 10px 18px;
+      display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
+      color: #222; font-size: 13px; z-index: 2000;
+      user-select: none;
+    }
+    .sep { width: 1px; height: 22px; background: rgba(0, 0, 0, 0.15); flex-shrink: 0; }
+    .ctrl { display: flex; align-items: center; gap: 7px; }
+    button {
+      background: rgba(0, 0, 0, 0.06);
+      border: 1px solid rgba(0, 0, 0, 0.2);
+      color: #333; padding: 5px 14px; border-radius: 3px;
+      cursor: pointer; font-size: 13px; font-family: inherit; white-space: nowrap;
+      transition: background 0.12s;
+    }
+    button:hover { background: rgba(0, 0, 0, 0.12); }
+    input[type=range] { width: 90px; accent-color: #555; cursor: pointer; }
+    input[type=checkbox] { cursor: pointer; accent-color: #555; }
+    .val { color: #666; min-width: 22px; text-align: right; }
+
+    /* ── Stage: map on the left, video over text on the right ──
+       flex-basis `auto` lets the calc() height drive the box, while flex
+       1/1 still corrects it if --header-h is momentarily stale. */
+    #stage {
+      flex: 1 1 auto;
+      height: calc(100vh - var(--header-h));
+      min-height: 0; min-width: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) var(--right-col);
+      grid-template-rows: var(--right-split);
+    }
+    /* Leaflet breaks if its cell can be pushed open by its own contents,
+       hence min-height/min-width 0 on all three. */
+    #map {
+      grid-column: 1; grid-row: 1 / -1;
+      position: relative;
+      min-height: 0; min-width: 0;
+      background: #fff;
+    }
+    /* Attribution to the right of the zoom buttons rather than stacked above
+       them: Leaflet floats each control with clear:both, so the bottom-left
+       corner becomes a bottom-aligned flex row instead. Leaflet prepends
+       controls in bottom corners, so order:1 is what puts the attribution
+       after the +/- rather than before it. */
+    .leaflet-bottom.leaflet-left {
+      display: flex;
+      align-items: flex-end;
+    }
+    .leaflet-bottom.leaflet-left .leaflet-control {
+      float: none;
+      clear: none;
+    }
+    .leaflet-bottom.leaflet-left .leaflet-control-attribution {
+      order: 1;
+      /* Leaflet zeroes this control's margins; 10px bottom lines its baseline
+         up with the zoom buttons, 10px left keeps them apart. */
+      margin: 0 0 10px 10px;
+    }
+
+    /* Video — top right. No controls, no title, no filename anywhere. */
+    #video-panel {
+      grid-column: 2; grid-row: 1;
+      position: relative;
+      min-height: 0; min-width: 0;
+      overflow: hidden;
+      background: var(--video-bg);
+      border-left: 1px solid var(--panel-border);
+      border-bottom: 1px solid var(--panel-border);
+      line-height: 0;
+    }
+    /* Pinned to the panel so the box is always definite: with height:100%
+       against a parent sized by aspect-ratio (the narrow layout) the
+       percentage resolves to auto and object-fit has nothing to work with.
+
+       `cover` is safe here because the cell is sized to the picture's 3:2
+       ratio (see --right-split): it crops off exactly the file's own black
+       pillarbox bars and nothing else, at every viewport size. */
+    #video {
+      position: absolute; inset: 0;
+      width: 100%; height: 100%;
+      object-fit: cover;
+      display: block;
+      background: var(--video-bg);
+    }
+
+    /* Explainer text — bottom right */
+    #text-panel {
+      grid-column: 2; grid-row: 2;
+      min-height: 0; min-width: 0;
+      overflow-y: auto;
+      overflow-x: hidden;
+      background: var(--panel-bg);
+      border-left: 1px solid var(--panel-border);
+      padding: 24px 28px;
+    }
+    #about-panel { max-width: 62ch; }
+    #text-panel h2 {
+      font-size: 11px; font-weight: bold;
+      letter-spacing: 0.14em; text-transform: uppercase;
+      color: var(--panel-heading);
+      margin-bottom: 14px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--panel-rule);
+    }
+    #text-panel p {
+      font-size: 15px; line-height: 1.55; color: var(--panel-text);
+      margin-bottom: 1em;
+    }
+    #text-panel p:last-child { margin-bottom: 0; }
+    #text-panel::-webkit-scrollbar { width: 8px; }
+    #text-panel::-webkit-scrollbar-thumb { background: var(--panel-scroll); border-radius: 4px; }
+    @media (min-width: 1920px) { #text-panel p { font-size: 16px; } }
+
+    /* Hiding the video hands its height to the text panel. */
+    body.no-video #video-panel { display: none; }
+    body.no-video #text-panel { grid-row: 1 / -1; }
+
+    .id-label {
+      background: transparent !important;
+      border: none !important;
+      box-shadow: none !important;
+      color: #111;
+      font-family: 'Courier New', monospace;
+      font-size: 11px;
+      font-weight: bold;
+      text-shadow: 0 0 3px #fff, 0 0 3px #fff;
+      padding: 0 !important;
+      white-space: nowrap;
+    }
+    .id-label::before { display: none !important; }
+
+    /* ── Modal ── */
+    #modal-backdrop {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.6);
+      z-index: 4000;
+      align-items: center; justify-content: center;
+    }
+    #modal-backdrop.open { display: flex; }
+    #modal-box {
+      background: #fff;
+      border-radius: 8px;
+      padding: 20px;
+      display: flex; flex-direction: column; align-items: center; gap: 12px;
+      max-width: 90vw;
+    }
+    #modal-img {
+      max-height: 70vh; max-width: 80vw;
+      width: auto; height: auto;
+      display: block; border-radius: 4px;
+    }
+    #modal-error {
+      display: none;
+      color: #888; font-size: 14px;
+      padding: 40px 20px; text-align: center;
+    }
+    #modal-caption {
+      font-size: 12px; color: #555;
+      font-family: 'Courier New', monospace; letter-spacing: 0.05em;
+    }
+    .modal-buttons { display: flex; gap: 8px; }
+
+    /* ── Dark theme ── */
+    body.dark-theme { background: #000; }
+    body.dark-theme #map { background: #000; }
+    body.dark-theme #loading { background: #000; color: #fff; }
+    body.dark-theme #title-bar {
+      background: #000;
+      border-bottom-color: rgba(255, 255, 255, 0.1);
+    }
+    body.dark-theme #title-bar h1 { color: #fff; }
+    body.dark-theme #panel {
+      background: rgba(0, 0, 0, 0.78);
+      border-bottom-color: rgba(255, 255, 255, 0.1);
+      color: #ccc;
+    }
+    body.dark-theme .sep { background: rgba(255, 255, 255, 0.18); }
+    body.dark-theme button {
+      background: rgba(255, 255, 255, 0.09);
+      border-color: rgba(255, 255, 255, 0.22);
+      color: #ccc;
+    }
+    body.dark-theme button:hover { background: rgba(255, 255, 255, 0.18); }
+    body.dark-theme input[type=range] { accent-color: #bbb; }
+    body.dark-theme input[type=checkbox] { accent-color: #bbb; }
+    body.dark-theme .val { color: #999; }
+    /* Separators and the text panel follow the theme; the video panel keeps
+       its dark backdrop in both. */
+    body.dark-theme {
+      --panel-border: rgba(255, 255, 255, 0.12);
+      --panel-bg: #0a0a0a;
+      --panel-heading: #777;
+      --panel-rule: rgba(255, 255, 255, 0.14);
+      --panel-text: #a8a8a8;
+      --panel-scroll: rgba(255, 255, 255, 0.2);
+    }
+    body.dark-theme #modal-box { background: #1c1c1c; }
+    body.dark-theme #modal-caption { color: #aaa; }
+    body.dark-theme #modal-error { color: #666; }
+    body.dark-theme .id-label {
+      color: #fff;
+      text-shadow: 0 0 4px #000, 0 0 4px #000, 0 0 4px #000;
+    }
+
+    /* Narrow screens: one column, map → video → text. #stage keeps the
+       viewport height and scrolls internally, since body is overflow:hidden. */
+    @media (max-width: 1023px) {
+      /* Flex rather than grid for the stack: the video panel's height comes
+         from aspect-ratio, and an `auto` grid row sizes to its (overflow:hidden)
+         contents instead, which let the video spill over the text panel.
+         flex: 0 0 auto keeps every panel at its real height and #stage scrolls. */
+      #stage {
+        display: flex;
+        flex-direction: column;
+        overflow-y: auto;
+      }
+      #map { flex: 0 0 auto; min-height: 60vh; }
+      #video-panel {
+        flex: 0 0 auto;
+        width: 100%; aspect-ratio: 3 / 2; height: auto;
+        min-height: auto;
+        border-left: none;
+      }
+      #text-panel {
+        flex: 0 0 auto;
+        max-height: 40vh;
+        min-height: auto;
+        border-left: none;
+        border-top: 1px solid var(--panel-border);
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="loading">Loading locations.json…</div>
+
+  <header id="title-bar">
+    <h1>The Lottery of Forgotten Dreams – Topographies of the Unseen <span class="byline">by Christian Berg (2026)</span></h1>
+  </header>
+
+  <div id="panel">
+    <div class="ctrl">
+      <span>Radius</span>
+      <input type="range" id="radius-slider" min="2" max="30" value="6">
+      <span class="val" id="radius-val">6</span><span>px</span>
+    </div>
+    <div class="sep"></div>
+    <label class="ctrl"><input type="checkbox" id="show-labels"> Ticket Number</label>
+    <div class="sep"></div>
+    <label class="ctrl"><input type="checkbox" id="show-map" checked> Map</label>
+    <div class="sep"></div>
+    <label class="ctrl"><input type="checkbox" id="show-video" checked> Video</label>
+    <div class="sep"></div>
+    <label class="ctrl"><input type="checkbox" id="dark-mode"> Dark mode</label>
+    <div class="sep"></div>
+    <button id="btn-fit">Fit dots</button>
+    <div class="sep"></div>
+    <button id="btn-fullscreen">⛶ Fullscreen</button>
+  </div>
+
+  <div id="stage">
+    <div id="map"></div>
+
+    <div id="video-panel">
+      <!-- Silent source. `muted` is also what lets browsers autoplay it.
+           Drop the file in as assets/LotteryAll.mp4; the third <source> is
+           the copy currently sitting in the project root. -->
+      <video id="video" autoplay muted loop playsinline preload="auto"
+             disablepictureinpicture controlslist="nodownload">
+        <source src="assets/LotteryAll.mp4" type="video/mp4">
+        <source src="assets/LotteryAll.webm" type="video/webm">
+        <source src="LotteryAll.mp4" type="video/mp4">
+      </video>
+    </div>
+
+    <aside id="text-panel">
+      <section id="about-panel"><!-- EDIT TEXT HERE -->
+        <h2>About this project</h2>
+        <p>This project explores how to re-connect to a place one feels almost too familiar with after living there for nearly two decades. The seemingly familiar is often the hardest to explore, as it hides in plain sight. In <em>The Lottery of Forgotten Dreams – Topographies of the Unseen</em> I re-encounter Saigon, my home for most of my adult life, using photography, conceptual and algorithmic art alongside local custom.</p>
+        <p>It starts with a number. Numerology is deeply embedded in Vietnamese society. Lottery is omnipresent, with tickets sold on almost every corner. Played on top of it is số đề, a second game rooted in ancient mythology: the last two digits of a ticket name a legendary creature (repeated after 40), and those who win gain not only earthly fortune but a connection to the spiritual world.</p>
+        <p>A small Python script turns a photographed ticket's six-digit number into a fixed coordinate within Saigon; the same number always produces the same point. I visited the 100 places the numbers led me to and photographed each. It is a game, and its rules can be rewritten.</p>
+        <p>Each site photograph is then combined with an AI-generated image of the creature named by the last two digits, drawn from a library of 4,000 I created based on Albrecht Dürer's drawings. The composite is run through Processing: pixelated and rotated in three dimensions, with colour and geometry derived from the ticket number, resulting in often abstract images that show the overlap of the real and the spiritual world.</p>
+      </section><!-- /EDIT TEXT HERE -->
+    </aside>
+  </div>
+
+  <div id="modal-backdrop">
+    <div id="modal-box">
+      <img id="modal-img" src="" alt="">
+      <div id="modal-error">Image not available</div>
+      <div id="modal-caption"></div>
+      <div class="modal-buttons">
+        <button id="btn-modal-close">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="locations.data.js"></script>
+  <script>
+    const loadingEl = document.getElementById('loading');
+
+    const map = L.map('map', { zoomControl: false });
+    // Both controls live on the left — the right side belongs to the panels.
+    L.control.zoom({ position: 'bottomleft' }).addTo(map);
+    map.attributionControl.setPosition('bottomleft');
+
+    // CARTO basemap API key — get one at https://carto.com/basemaps/apikey/
+    // Without it the tiles show an "API KEY REQUIRED" watermark.
+    const CARTO_KEY = 'cb1_3ix4_2_300b93a533869d8f6884e9f2';
+
+    const lightTiles = L.tileLayer(
+      `https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png?key=${CARTO_KEY}`,
+      { attribution: '&copy; OpenStreetMap contributors &copy; CARTO', subdomains: 'abcd', maxZoom: 19 }
+    );
+    const darkTiles = L.tileLayer(
+      `https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png?key=${CARTO_KEY}`,
+      { attribution: '&copy; OpenStreetMap contributors &copy; CARTO', subdomains: 'abcd', maxZoom: 19 }
+    );
+
+    let currentTiles = lightTiles;
+    let mapVisible = true;
+    currentTiles.addTo(map);
+
+    let locations = [];
+    let markers = [];
+    let dotColors = [];
+    let dotRadius = 6;
+    let showLabels = false;
+
+    function randomColor() {
+      return `hsl(${Math.random() * 360 | 0},${60 + (Math.random() * 40 | 0)}%,${50 + (Math.random() * 30 | 0)}%)`;
+    }
+
+    function createMarkers() {
+      markers.forEach(m => map.removeLayer(m));
+      markers = locations.map((loc, i) =>
+        L.circleMarker([loc.lat, loc.lng], {
+          radius: dotRadius,
+          fillColor: dotColors[i],
+          color: dotColors[i],
+          fillOpacity: 1,
+          weight: 0
+        }).addTo(map).on('click', () => openImageModal(loc.id))
+      );
+    }
+
+    function applyLabels() {
+      markers.forEach((m, i) => {
+        m.unbindTooltip();
+        if (showLabels) {
+          m.bindTooltip(locations[i].id, {
+            permanent: true,
+            direction: 'right',
+            className: 'id-label',
+            offset: [8, 0]
+          }).openTooltip();
+        }
+      });
+    }
+
+    // The panels now sit beside the map rather than on top of it, so the
+    // whole map cell is free and the padding is even.
+    function fitToLocations() {
+      if (!locations.length) return;
+      map.fitBounds(L.latLngBounds(locations.map(l => [l.lat, l.lng])), { padding: [40, 40] });
+    }
+
+    // Radius
+    const radiusSlider = document.getElementById('radius-slider');
+    const radiusVal    = document.getElementById('radius-val');
+    radiusSlider.addEventListener('input', () => {
+      dotRadius = +radiusSlider.value;
+      radiusVal.textContent = dotRadius;
+      markers.forEach(m => m.setRadius(dotRadius));
+    });
+
+    // Ticket Number labels
+    document.getElementById('show-labels').addEventListener('change', e => {
+      showLabels = e.target.checked;
+      applyLabels();
+    });
+
+    // Map on/off — uses whichever tile layer is currently active
+    document.getElementById('show-map').addEventListener('change', e => {
+      mapVisible = e.target.checked;
+      if (mapVisible) map.addLayer(currentTiles);
+      else map.removeLayer(currentTiles);
+    });
+
+    // Video panel on/off
+    document.getElementById('show-video').addEventListener('change', e => {
+      document.body.classList.toggle('no-video', !e.target.checked);
+    });
+
+    // Re-frame the dots around the panels
+    document.getElementById('btn-fit').addEventListener('click', fitToLocations);
+
+    // Dark mode toggle
+    document.getElementById('dark-mode').addEventListener('change', e => {
+      const isDark = e.target.checked;
+      const nextTiles = isDark ? darkTiles : lightTiles;
+      if (mapVisible) {
+        map.removeLayer(currentTiles);
+        map.addLayer(nextTiles);
+      }
+      currentTiles = nextTiles;
+      document.body.classList.toggle('dark-theme', isDark);
+    });
+
+    // Fullscreen
+    const btnFullscreen = document.getElementById('btn-fullscreen');
+    btnFullscreen.addEventListener('click', async () => {
+      try {
+        if (!document.fullscreenElement) await document.documentElement.requestFullscreen();
+        else await document.exitFullscreen();
+      } catch (e) { console.error('Fullscreen error:', e); }
+    });
+    document.addEventListener('fullscreenchange', () => {
+      btnFullscreen.textContent = document.fullscreenElement ? '⛶ Exit fullscreen' : '⛶ Fullscreen';
+    });
+
+    // The grid is sized off the real title bar + toolbar rather than a magic
+    // number, so either one wrapping can't push the stage past the viewport.
+    const headerEls = [document.getElementById('title-bar'), document.getElementById('panel')];
+    function syncHeaderHeight() {
+      const h = headerEls.reduce((sum, el) => sum + el.offsetHeight, 0);
+      document.documentElement.style.setProperty('--header-h', h + 'px');
+    }
+    syncHeaderHeight();
+    const headerObserver = new ResizeObserver(syncHeaderHeight);
+    headerEls.forEach(el => headerObserver.observe(el));
+
+    // Keep Leaflet in sync whenever the map cell changes size (window resized,
+    // panels toggled, fullscreen entered/left). Debounced so the observer
+    // can't fight its own relayout.
+    let resizeTimer = null;
+    function scheduleInvalidate() {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => map.invalidateSize(), 100);
+    }
+    new ResizeObserver(scheduleInvalidate).observe(document.getElementById('map'));
+    window.addEventListener('resize', scheduleInvalidate);
+    document.addEventListener('fullscreenchange', scheduleInvalidate);
+
+    // Looping video. A missing file just leaves the panel's dark block —
+    // no fallback text, since that would put the filename on screen.
+    const video = document.getElementById('video');
+    video.addEventListener('error', () => console.warn('Video source unavailable'), true);
+
+    // Modal
+    const modalBackdrop = document.getElementById('modal-backdrop');
+    const modalImg      = document.getElementById('modal-img');
+    const modalError    = document.getElementById('modal-error');
+    const modalCaption  = document.getElementById('modal-caption');
+    const btnModalClose = document.getElementById('btn-modal-close');
+
+    function openImageModal(id) {
+      modalImg.style.display = 'block';
+      modalError.style.display = 'none';
+      modalImg.onerror = () => {
+        modalImg.style.display = 'none';
+        modalError.style.display = 'block';
+      };
+      modalImg.src = `./web4map/${id}x.jpg`;
+      modalImg.alt = id;
+      modalCaption.textContent = id;
+      modalBackdrop.classList.add('open');
+    }
+
+    function closeModal() {
+      modalBackdrop.classList.remove('open');
+      modalImg.src = '';
+    }
+
+    btnModalClose.addEventListener('click', closeModal);
+    modalBackdrop.addEventListener('click', e => { if (e.target === modalBackdrop) closeModal(); });
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+    // Boot — prefer locations.json, fall back to the bundled locations.data.js
+    // (opening this file straight from disk makes file:// fetch fail on CORS).
+    loadLocations()
+      .then(data => {
+        locations = data;
+        // Fresh set of dot colours on every page load.
+        dotColors = locations.map(() => randomColor());
+        createMarkers();
+        fitToLocations();
+        loadingEl.style.display = 'none';
+      })
+      .catch(err => {
+        loadingEl.textContent = `Failed to load locations — ${err.message}`;
+      });
+
+    function loadLocations() {
+      return fetch('locations.json')
+        .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+        .catch(err => {
+          if (Array.isArray(window.LOCATIONS) && window.LOCATIONS.length) {
+            console.warn(`locations.json unavailable (${err.message}) — using locations.data.js`);
+            return window.LOCATIONS;
+          }
+          throw err;
+        });
+    }
+  </script>
+</body>
+</html>
