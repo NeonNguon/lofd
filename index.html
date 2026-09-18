@@ -329,12 +329,11 @@
 
     <div id="video-panel">
       <!-- Silent source. `muted` is also what lets browsers autoplay it.
-           Drop the file in as assets/LotteryAll.mp4; the third <source> is
-           the copy currently sitting in the project root. -->
+           Streamed from Vimeo (the file is too large for the repo); the
+           second <source> is a local LotteryAll.mp4 for offline use. -->
       <video id="video" autoplay muted loop playsinline preload="auto"
              disablepictureinpicture controlslist="nodownload">
-        <source src="assets/LotteryAll.mp4" type="video/mp4">
-        <source src="assets/LotteryAll.webm" type="video/webm">
+        <source src="https://player.vimeo.com/progressive_redirect/playback/1226353089/rendition/1080p/file.mp4%20%281080p%29.mp4?loc=external&amp;log_user=0&amp;signature=9d3b7af835b9ec509ef48a895049f57d86bb45b0364ada139114e295ec491c65" type="video/mp4">
         <source src="LotteryAll.mp4" type="video/mp4">
       </video>
     </div>
